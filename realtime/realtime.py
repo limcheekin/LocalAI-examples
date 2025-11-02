@@ -8,11 +8,14 @@ import threading
 import soundfile as sf
 import numpy as np
 import time
+import queue
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'qwen3-0.6b')
 OPENAI_BASE_URL = os.getenv('OPENAI_BASE_URL', 'http://localhost:8080')
+OPENAI_TTS_API_KEY = os.getenv('OPENAI_TTS_API_KEY', OPENAI_API_KEY)
+OPENAI_TTS_BASE_URL = os.getenv('OPENAI_TTS_BASE_URL', OPENAI_BASE_URL)
 OPENAI_TTS_VOICE = os.getenv('OPENAI_TTS_VOICE', '')
 OPENAI_TTS_MODEL = os.getenv('OPENAI_TTS_MODEL', 'voice-en-us-amy-low')
 WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'whisper-large-turbo-q5_0')
@@ -22,13 +25,22 @@ BACKGROUND_AUDIO = os.getenv('BACKGROUND_AUDIO', 'false').lower() in ['true', '1
 DEBUG_PLAYBACK = os.getenv('DEBUG_PLAYBACK', 'false').lower() in ['true', '1', 'yes', 'on']
 WAKE_WORD = os.getenv('WAKE_WORD', '')  # Empty string means no wake word
 MCP_MODE = os.getenv('MCP_MODE', 'false').lower() in ['true', '1', 'yes', 'on']
+STREAMING_TTS = os.getenv('STREAMING_TTS', 'true').lower() in ['true', '1', 'yes', 'on']
+STREAM_BUFFER_SIZE = int(os.getenv('STREAM_BUFFER_SIZE', '4096'))  # Bytes to buffer before starting playback
 
 # Initialize OpenAI client
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL
 )
-# Initialize OpenAI client
+
+# Initialize OpenAI TTS client
+tts_client = OpenAI(
+    api_key=OPENAI_TTS_API_KEY,
+    base_url=OPENAI_TTS_BASE_URL
+)
+
+# Initialize OpenAI MCP client
 mcpclient = OpenAI(
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL+"/mcp"
@@ -44,6 +56,7 @@ conversation_history = []
 # Global variables for audio control
 audio_playing = False
 audio_thread = None
+stop_playback_event = threading.Event()
 
 def start_callback():
     global audio_playing
@@ -52,11 +65,204 @@ def start_callback():
     # Stop any playing audio when recording starts (only if background audio is enabled)
     if BACKGROUND_AUDIO and audio_playing:
         print("🔇 Stopping audio for recording...")
+        stop_playback_event.set()
         pygame.mixer.music.stop()
         audio_playing = False
 
 def stop_callback():
     print("⏹️ Recording stopped!")
+
+
+class StreamingAudioPlayer:
+    """Handles streaming audio playback with buffering"""
+    
+    def __init__(self, buffer_size=4096):
+        self.buffer_size = buffer_size
+        self.audio_queue = queue.Queue()
+        self.is_streaming = True
+        self.playback_thread = None
+        self.temp_file = None
+        self.temp_file_path = None
+        self.total_bytes = 0
+        self.stop_event = threading.Event()
+        
+    def start_streaming(self):
+        """Initialize streaming session"""
+        self.is_streaming = True
+        self.total_bytes = 0
+        self.audio_queue = queue.Queue()
+        self.stop_event.clear()
+        
+        # Create temporary file for buffering (use mp3 extension for compatibility)
+        fd, self.temp_file_path = tempfile.mkstemp(suffix='.mp3')
+        self.temp_file = os.fdopen(fd, 'wb')
+        
+    def add_chunk(self, chunk):
+        """Add audio chunk to the stream"""
+        if chunk and self.is_streaming:
+            self.audio_queue.put(chunk)
+            self.total_bytes += len(chunk)
+            
+    def finish_streaming(self):
+        """Signal that streaming is complete"""
+        self.is_streaming = False
+        self.audio_queue.put(None)  # Sentinel to signal end of stream
+        
+    def _write_chunks_to_file(self):
+        """Write all chunks from queue to file"""
+        chunks_written = 0
+        
+        while True:
+            try:
+                # Wait for chunks with timeout
+                chunk = self.audio_queue.get(timeout=1.0)
+                
+                if chunk is None:  # End of stream
+                    break
+                    
+                # Write chunk to file
+                self.temp_file.write(chunk)
+                chunks_written += len(chunk)
+                
+            except queue.Empty:
+                # If streaming is done and queue is empty, we're finished
+                if not self.is_streaming:
+                    break
+                continue
+        
+        # Ensure all data is flushed and file is closed
+        self.temp_file.flush()
+        self.temp_file.close()
+        
+        return chunks_written
+        
+    def play_stream_background(self):
+        """Play streamed audio in background thread"""
+        global audio_playing
+        
+        def playback_worker():
+            global audio_playing
+            
+            try:
+                audio_playing = True
+                
+                # Start a thread to write chunks to file
+                write_thread = threading.Thread(target=self._write_chunks_to_file, daemon=True)
+                write_thread.start()
+                
+                # Wait for minimum buffer
+                bytes_buffered = 0
+                buffer_ready = False
+                
+                print(f"📥 Buffering audio (target: {self.buffer_size} bytes)...")
+                
+                while not buffer_ready and self.is_streaming:
+                    time.sleep(0.1)
+                    
+                    # Check current file size
+                    try:
+                        bytes_buffered = os.path.getsize(self.temp_file_path)
+                        if bytes_buffered >= self.buffer_size:
+                            buffer_ready = True
+                    except:
+                        continue
+                
+                # If streaming ended but we have data, consider buffer ready
+                if not buffer_ready and not self.is_streaming:
+                    bytes_buffered = os.path.getsize(self.temp_file_path)
+                    if bytes_buffered > 0:
+                        buffer_ready = True
+                
+                if not buffer_ready:
+                    print("⚠️ No audio data buffered")
+                    audio_playing = False
+                    return
+                
+                print(f"🔊 Starting playback (buffered {bytes_buffered} bytes)")
+                
+                # Wait for write thread to finish
+                write_thread.join()
+                
+                # Load and play the complete audio file
+                try:
+                    pygame.mixer.music.load(self.temp_file_path)
+                    pygame.mixer.music.play()
+                except Exception as e:
+                    print(f"❌ Error loading audio: {e}")
+                    audio_playing = False
+                    self._cleanup()
+                    return
+                
+                # Wait for playback to finish or stop signal
+                while pygame.mixer.music.get_busy() and not self.stop_event.is_set() and not stop_playback_event.is_set():
+                    pygame.time.wait(100)
+                
+                print(f"✅ Streaming playback completed ({self.total_bytes} bytes total)")
+                
+            except Exception as e:
+                print(f"❌ Streaming playback error: {str(e)}")
+            finally:
+                audio_playing = False
+                self._cleanup()
+        
+        # Start playback in background thread
+        self.playback_thread = threading.Thread(target=playback_worker, daemon=True)
+        self.playback_thread.start()
+        
+    def play_stream_blocking(self):
+        """Play streamed audio in foreground (blocking)"""
+        global audio_playing
+        
+        try:
+            audio_playing = True
+            
+            # Write all chunks to file
+            print(f"📥 Buffering audio...")
+            chunks_written = self._write_chunks_to_file()
+            
+            if chunks_written == 0:
+                print("⚠️ No audio data received")
+                audio_playing = False
+                self._cleanup()
+                return
+            
+            print(f"🔊 Starting playback ({chunks_written} bytes)")
+            
+            # Load and play the audio file
+            try:
+                pygame.mixer.music.load(self.temp_file_path)
+                pygame.mixer.music.play()
+            except Exception as e:
+                print(f"❌ Error loading audio: {e}")
+                audio_playing = False
+                self._cleanup()
+                return
+            
+            # Wait for playback to finish
+            while pygame.mixer.music.get_busy():
+                pygame.time.wait(100)
+            
+            print(f"✅ Playback completed ({self.total_bytes} bytes total)")
+            
+        except Exception as e:
+            print(f"❌ Streaming playback error: {str(e)}")
+        finally:
+            audio_playing = False
+            self._cleanup()
+    
+    def _cleanup(self):
+        """Clean up temporary file"""
+        try:
+            if self.temp_file and not self.temp_file.closed:
+                self.temp_file.close()
+        except:
+            pass
+        
+        try:
+            if self.temp_file_path and os.path.exists(self.temp_file_path):
+                os.unlink(self.temp_file_path)
+        except Exception as e:
+            print(f"⚠️ Could not delete temp file: {e}")
 
 
 def play_audio_background(audio_file_path):
@@ -71,7 +277,7 @@ def play_audio_background(audio_file_path):
             pygame.mixer.music.play()
             
             # Wait for playback to finish
-            while pygame.mixer.music.get_busy() and audio_playing:
+            while pygame.mixer.music.get_busy() and audio_playing and not stop_playback_event.is_set():
                 pygame.time.wait(100)
             
             # Clean up
@@ -86,7 +292,10 @@ def play_audio_background(audio_file_path):
             audio_playing = False
             # Clean up file if it exists
             if os.path.exists(audio_file_path):
-                os.unlink(audio_file_path)
+                try:
+                    os.unlink(audio_file_path)
+                except:
+                    pass
     
     # Start audio in background thread
     audio_thread = threading.Thread(target=audio_worker, daemon=True)
@@ -115,7 +324,10 @@ def play_audio_blocking(audio_file_path):
         audio_playing = False
         # Clean up file if it exists
         if os.path.exists(audio_file_path):
-            os.unlink(audio_file_path)
+            try:
+                os.unlink(audio_file_path)
+            except:
+                pass
 
 def clean_text_for_tts(text):
     """Clean text for TTS by removing markdown, emojis and newlines"""
@@ -133,7 +345,7 @@ def clean_text_for_tts(text):
     text = re.sub(r'[\U0001FA70-\U0001FAFF]', '', text)  # Symbols and Pictographs Extended-A
     
     # Remove other common emoji patterns
-    text = re.sub(r'[🔥🚀💡🎤⏹️🔊✅❌⚠️📝🎤🗣️🌐🔑🎯👤🤖]', '', text)
+    text = re.sub(r'[🔥🚀💡🎤⏹️📊✅❌⚠️📝🎤🗣️🌐🔑🎯💤🤖]', '', text)
     
     # Remove markdown formatting
     # Remove bold/italic
@@ -161,13 +373,67 @@ def clean_text_for_tts(text):
     
     return text
 
-def text_to_speech(text):
-    """Convert text to speech using OpenAI TTS API"""
+def text_to_speech_streaming(text):
+    """Convert text to speech using OpenAI TTS API with streaming"""
     try:
-        print("🔊 Generating speech...")
+        print("📊 Generating speech (streaming)...")
+        stop_playback_event.clear()
         
         # Clean text for TTS
         cleaned_text = clean_text_for_tts(text)
+        
+        if not cleaned_text:
+            print("⚠️ No text to synthesize after cleaning")
+            return
+        
+        # Create streaming player
+        player = StreamingAudioPlayer(buffer_size=STREAM_BUFFER_SIZE)
+        player.start_streaming()
+        
+        # Start playback thread if background mode
+        if BACKGROUND_AUDIO:
+            player.play_stream_background()
+        
+        # Call OpenAI TTS API with streaming
+        try:
+            with tts_client.audio.speech.with_streaming_response.create(
+                model=OPENAI_TTS_MODEL,
+                voice=OPENAI_TTS_VOICE,
+                input=cleaned_text,
+                response_format="mp3"
+            ) as response:
+                # Stream audio chunks
+                for chunk in response.iter_bytes(chunk_size=1024):
+                    if stop_playback_event.is_set():
+                        print("🔇 Streaming interrupted by user")
+                        break
+                    player.add_chunk(chunk)
+        except Exception as e:
+            print(f"❌ TTS API Error: {str(e)}")
+            player.finish_streaming()
+            return
+        
+        # Signal end of streaming
+        player.finish_streaming()
+        
+        # If blocking mode, wait for playback to complete
+        if not BACKGROUND_AUDIO:
+            player.play_stream_blocking()
+        
+    except Exception as e:
+        print(f"❌ Streaming TTS Error: {str(e)}")
+
+def text_to_speech_legacy(text):
+    """Convert text to speech using OpenAI TTS API (legacy non-streaming)"""
+    try:
+        print("📊 Generating speech (legacy mode)...")
+        
+        # Clean text for TTS
+        cleaned_text = clean_text_for_tts(text)
+        
+        if not cleaned_text:
+            print("⚠️ No text to synthesize after cleaning")
+            return
         
         # Call OpenAI TTS API
         response = client.audio.speech.create(
@@ -177,7 +443,7 @@ def text_to_speech(text):
         )
         
         # Save audio to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
             temp_file.write(response.content)
             temp_file_path = temp_file.name
         
@@ -191,6 +457,13 @@ def text_to_speech(text):
         
     except Exception as e:
         print(f"❌ TTS Error: {str(e)}")
+
+def text_to_speech(text):
+    """Convert text to speech - uses streaming or legacy based on configuration"""
+    if STREAMING_TTS:
+        text_to_speech_streaming(text)
+    else:
+        text_to_speech_legacy(text)
 
 def get_openai_response(user_text):
     """Get response from OpenAI API"""
@@ -235,7 +508,7 @@ def validate_config():
 def process_text(text):
     """Process the recorded text and get AI response"""
     if text and text.strip():
-        print(f"\n👤 You: {text}")
+        print(f"\n💤 You: {text}")
         
         # Get AI response
         ai_response = get_openai_response(text)
@@ -252,7 +525,7 @@ def process_text(text):
 def play_wav_file(wav_file_path):
     """Play a WAV file for debugging"""
     try:
-        print(f"🔊 Playing WAV file: {wav_file_path}")
+        print(f"📊 Playing WAV file: {wav_file_path}")
         
         # Check if file exists
         if not os.path.exists(wav_file_path):
@@ -261,7 +534,7 @@ def play_wav_file(wav_file_path):
         
         # Get file size for debugging
         file_size = os.path.getsize(wav_file_path)
-        print(f"📁 File size: {file_size} bytes")
+        print(f"📝 File size: {file_size} bytes")
         
         # Play the audio file
         pygame.mixer.music.load(wav_file_path)
@@ -368,7 +641,7 @@ class CustomAudioRecorder(AudioToTextRecorder):
 def process_audio_with_openai_whisper(recorder):
     """Process recorded audio using OpenAI Whisper API"""
     try:
-        print("🔊 Processing audio with OpenAI Whisper...")
+        print("📊 Processing audio with OpenAI Whisper...")
         
         # Get the processed audio data (numpy array)
         audio_data = recorder.get_audio_data()
@@ -412,9 +685,12 @@ if __name__ == '__main__':
     print(f"   🎤 TTS Model: {OPENAI_TTS_MODEL}")
     print(f"   🗣️ TTS Voice: {OPENAI_TTS_VOICE}")
     print(f"   🌐 Base URL: {OPENAI_BASE_URL}")
-    print(f"   🔊 Background Audio: {'✅ Enabled' if BACKGROUND_AUDIO else '❌ Disabled'}")
+    print(f"   📊 Background Audio: {'✅ Enabled' if BACKGROUND_AUDIO else '❌ Disabled'}")
     print(f"   🎵 Debug Playback: {'✅ Enabled' if DEBUG_PLAYBACK else '❌ Disabled'}")
     print(f"   🎯 Wake Word: {'✅ ' + WAKE_WORD if WAKE_WORD else '❌ Disabled'}")
+    print(f"   🎼 Streaming TTS: {'✅ Enabled' if STREAMING_TTS else '❌ Disabled'}")
+    if STREAMING_TTS:
+        print(f"   📦 Stream Buffer: {STREAM_BUFFER_SIZE} bytes")
     print(f"   🔑 API Key: ✅ Set")
     print("🎯 Starting voice assistant...")
     if WAKE_WORD:
