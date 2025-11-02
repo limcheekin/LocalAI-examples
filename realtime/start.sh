@@ -7,5 +7,6 @@ export OPENAI_BASE_URL=http://192.168.1.111:8880/v1
 export WHISPER_MODEL=whisper-1
 export WHISPER_LANGUAGE=en
 export SYSTEM_PROMPT="You are a helpful and friendly assistant. Provide clear, accurate, and concise responses."
+export TTS_FORMAT=opus
 
 bash run.sh

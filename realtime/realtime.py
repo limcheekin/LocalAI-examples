@@ -27,6 +27,7 @@ WAKE_WORD = os.getenv('WAKE_WORD', '')  # Empty string means no wake word
 MCP_MODE = os.getenv('MCP_MODE', 'false').lower() in ['true', '1', 'yes', 'on']
 STREAMING_TTS = os.getenv('STREAMING_TTS', 'true').lower() in ['true', '1', 'yes', 'on']
 STREAM_BUFFER_SIZE = int(os.getenv('STREAM_BUFFER_SIZE', '4096'))  # Bytes to buffer before starting playback
+TTS_FORMAT = os.getenv('TTS_FORMAT', 'mp3')  # Options: mp3, opus, aac, flac, wav, pcm
 
 # Initialize OpenAI client
 client = OpenAI(
@@ -76,8 +77,9 @@ def stop_callback():
 class StreamingAudioPlayer:
     """Handles streaming audio playback with buffering"""
     
-    def __init__(self, buffer_size=4096):
+    def __init__(self, buffer_size=4096, audio_format='mp3'):
         self.buffer_size = buffer_size
+        self.audio_format = audio_format
         self.audio_queue = queue.Queue()
         self.is_streaming = True
         self.playback_thread = None
@@ -93,8 +95,9 @@ class StreamingAudioPlayer:
         self.audio_queue = queue.Queue()
         self.stop_event.clear()
         
-        # Create temporary file for buffering (use mp3 extension for compatibility)
-        fd, self.temp_file_path = tempfile.mkstemp(suffix='.mp3')
+        # Create temporary file for buffering with appropriate extension
+        file_extension = f'.{self.audio_format}'
+        fd, self.temp_file_path = tempfile.mkstemp(suffix=file_extension)
         self.temp_file = os.fdopen(fd, 'wb')
         
     def add_chunk(self, chunk):
@@ -122,6 +125,7 @@ class StreamingAudioPlayer:
                     
                 # Write chunk to file
                 self.temp_file.write(chunk)
+                self.temp_file.flush()  # Flush after each chunk for immediate availability
                 chunks_written += len(chunk)
                 
             except queue.Empty:
@@ -150,38 +154,46 @@ class StreamingAudioPlayer:
                 write_thread = threading.Thread(target=self._write_chunks_to_file, daemon=True)
                 write_thread.start()
                 
-                # Wait for minimum buffer
+                # Wait for minimum buffer OR streaming to complete
                 bytes_buffered = 0
                 buffer_ready = False
                 
                 print(f"📥 Buffering audio (target: {self.buffer_size} bytes)...")
                 
-                while not buffer_ready and self.is_streaming:
-                    time.sleep(0.1)
+                # Wait for either buffer size or completion
+                while not buffer_ready:
+                    time.sleep(0.05)  # Check more frequently
                     
                     # Check current file size
                     try:
                         bytes_buffered = os.path.getsize(self.temp_file_path)
-                        if bytes_buffered >= self.buffer_size:
+                        # Buffer is ready if we have enough data OR streaming is done
+                        if bytes_buffered >= self.buffer_size or (not self.is_streaming and bytes_buffered > 0):
                             buffer_ready = True
                     except:
                         continue
+                    
+                    # Timeout protection - if streaming done and no data, exit
+                    if not self.is_streaming and not write_thread.is_alive() and bytes_buffered == 0:
+                        print("⚠️ Streaming completed but no audio data received")
+                        audio_playing = False
+                        return
                 
-                # If streaming ended but we have data, consider buffer ready
-                if not buffer_ready and not self.is_streaming:
-                    bytes_buffered = os.path.getsize(self.temp_file_path)
-                    if bytes_buffered > 0:
-                        buffer_ready = True
+                print(f"🔊 Buffer ready ({bytes_buffered} bytes), waiting for complete file...")
                 
-                if not buffer_ready:
-                    print("⚠️ No audio data buffered")
+                # Wait for write thread to finish writing all chunks
+                write_thread.join(timeout=30)  # 30 second timeout for safety
+                
+                # Get final file size
+                final_size = os.path.getsize(self.temp_file_path)
+                
+                if final_size == 0:
+                    print("⚠️ No audio data in file")
                     audio_playing = False
+                    self._cleanup()
                     return
                 
-                print(f"🔊 Starting playback (buffered {bytes_buffered} bytes)")
-                
-                # Wait for write thread to finish
-                write_thread.join()
+                print(f"🔊 Starting playback ({final_size} bytes)")
                 
                 # Load and play the complete audio file
                 try:
@@ -386,8 +398,8 @@ def text_to_speech_streaming(text):
             print("⚠️ No text to synthesize after cleaning")
             return
         
-        # Create streaming player
-        player = StreamingAudioPlayer(buffer_size=STREAM_BUFFER_SIZE)
+        # Create streaming player with configured format
+        player = StreamingAudioPlayer(buffer_size=STREAM_BUFFER_SIZE, audio_format=TTS_FORMAT)
         player.start_streaming()
         
         # Start playback thread if background mode
@@ -400,7 +412,7 @@ def text_to_speech_streaming(text):
                 model=OPENAI_TTS_MODEL,
                 voice=OPENAI_TTS_VOICE,
                 input=cleaned_text,
-                response_format="mp3"
+                response_format=TTS_FORMAT
             ) as response:
                 # Stream audio chunks
                 for chunk in response.iter_bytes(chunk_size=1024):
@@ -683,7 +695,7 @@ if __name__ == '__main__':
     print("💡 Configuration:")
     print(f"   📝 Chat Model: {OPENAI_MODEL}")
     print(f"   🎤 TTS Model: {OPENAI_TTS_MODEL}")
-    print(f"   🗣️ TTS Voice: {OPENAI_TTS_VOICE}")
+    print(f"   🗣️  TTS Voice: {OPENAI_TTS_VOICE}")
     print(f"   🌐 Base URL: {OPENAI_BASE_URL}")
     print(f"   📊 Background Audio: {'✅ Enabled' if BACKGROUND_AUDIO else '❌ Disabled'}")
     print(f"   🎵 Debug Playback: {'✅ Enabled' if DEBUG_PLAYBACK else '❌ Disabled'}")
@@ -691,6 +703,7 @@ if __name__ == '__main__':
     print(f"   🎼 Streaming TTS: {'✅ Enabled' if STREAMING_TTS else '❌ Disabled'}")
     if STREAMING_TTS:
         print(f"   📦 Stream Buffer: {STREAM_BUFFER_SIZE} bytes")
+        print(f"   🎵 Audio Format: {TTS_FORMAT}")
     print(f"   🔑 API Key: ✅ Set")
     print("🎯 Starting voice assistant...")
     if WAKE_WORD:
