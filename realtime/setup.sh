@@ -17,7 +17,7 @@ elif command -v dnf &> /dev/null; then
 elif command -v apt &> /dev/null; then
     echo "📦 Installing system dependencies with apt..."
     $SUDO apt update
-    $SUDO apt install -y portaudio19-dev python3-dev python3-pip python3-venv
+#    $SUDO apt install -y portaudio19-dev python3-dev python3-pip python3-venv
 elif command -v yum &> /dev/null; then
     echo "📦 Installing system dependencies with yum..."
     $SUDO yum install -y portaudio-devel python3-devel python3-pip
